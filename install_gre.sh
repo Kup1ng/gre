@@ -1,24 +1,21 @@
 #!/usr/bin/env bash
-# install_gre.sh – یک‌جا همه‌چیز را بساز و فعال کن
 set -euo pipefail
 
-# ---------- بررسی دسترسی ----------
 if [[ $EUID -ne 0 ]]; then
-  echo "این اسکریپت باید با کاربر root اجرا شود (یا sudo)." >&2
+  echo "Run this script as root or with sudo." >&2
   exit 1
 fi
 
-# ---------- ورودی کاربر ----------
-read -rp "این سرور «ایران» است یا «خارج»؟ [ir/kh]: " LOCATION
+read -rp "Is this the IRAN or FOREIGN server? [ir/kh]: " LOCATION
 LOCATION=$(echo "$LOCATION" | tr '[:upper:]' '[:lower:]')
 if [[ "$LOCATION" != "ir" && "$LOCATION" != "kh" ]]; then
-  echo "فقط ir یا kh مجاز است!" >&2 ; exit 1
+  echo "Only 'ir' or 'kh' is accepted." >&2 ; exit 1
 fi
 
-read -rp "آدرس IP سرور ایران:  " IP_IR
-read -rp "آدرس IP سرور خارج:   " IP_KH
+read -rp "Enter Iran server IP:  " IP_IR
+read -rp "Enter Foreign server IP:  " IP_KH
 
-# ---------- ساخت فایل /etc/gre.local ----------
+# Create gre.local
 GRE_SCRIPT="/etc/gre.local"
 if [[ "$LOCATION" == "ir" ]]; then
   cat > "$GRE_SCRIPT" <<EOF
@@ -41,11 +38,10 @@ EOF
 fi
 chmod +x "$GRE_SCRIPT"
 
-# ---------- ذخیره موقعیت برای واچ‌داگ ----------
 echo "$LOCATION" > /etc/gre_location.flag
 chmod 644 /etc/gre_location.flag
 
-# ---------- یونیت gre-local ----------
+# gre-local.service
 cat > /etc/systemd/system/gre-local.service <<'EOF'
 [Unit]
 Description=/etc/gre.local Compatibility
@@ -64,15 +60,15 @@ SysVStartPriority=99
 WantedBy=multi-user.target
 EOF
 
-# ---------- اسکریپت پایش ----------
+# Watchdog script
 cat > /usr/local/sbin/gre_watchdog.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
 LOCATION=$(cat /etc/gre_location.flag 2>/dev/null || echo "unknown")
-PING_INTERVAL=1      # ثانیه
-MAX_LOSS=10          # چند ثانیه قطع متوالی
-RECREATE_DELAY=30    # ثانیه
+PING_INTERVAL=1
+MAX_LOSS=10
+RECREATE_DELAY=30
 SCRIPT_RECREATE="/etc/gre.local"
 AUTO_RESTART_IR="/usr/bin/auto_restart_cronjob.sh"
 
@@ -83,7 +79,8 @@ elif [[ "$LOCATION" == "kh" ]]; then
   GRE_NAME="gre-kh"
   PEER_IP="172.17.1.2"
 else
-  echo "مکان سرور مشخص نیست!" ; exit 1
+  echo "Unknown location. Exiting."
+  exit 1
 fi
 
 loss=0
@@ -95,7 +92,7 @@ while true; do
   fi
 
   if (( loss >= MAX_LOSS )); then
-    echo "$(date '+%F %T')  GRE down – recreating..."
+    echo "$(date '+%F %T') GRE down – recreating..."
     ip link delete "$GRE_NAME" || true
     [[ "$LOCATION" == "ir" ]] && "$AUTO_RESTART_IR" || true
     sleep "$RECREATE_DELAY"
@@ -107,7 +104,7 @@ done
 EOF
 chmod +x /usr/local/sbin/gre_watchdog.sh
 
-# ---------- یونیت واچ‌داگ ----------
+# gre-watchdog.service
 cat > /etc/systemd/system/gre-watchdog.service <<'EOF'
 [Unit]
 Description=GRE tunnel watchdog
@@ -124,9 +121,9 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-# ---------- فعال‌سازی سرویس‌ها ----------
+# Enable services
 systemctl daemon-reload
 systemctl enable --now gre-local
 systemctl enable --now gre-watchdog
 
-echo -e "\n✅ همه چیز انجام شد! تونل فعال است و واچ‌داگ در حال پایش مداوم می‌باشد."
+echo "GRE tunnel setup and watchdog started successfully."
