@@ -2,10 +2,22 @@
 
 set -e
 
-read -p "Do you want to install or remove a tunnel? (install/remove): " action
-if [[ "$action" != "install" && "$action" != "remove" ]]; then
-  echo "Invalid action. Choose 'install' or 'remove'."
+read -p "Do you want to install, remove or check status of tunnels? (install/remove/status): " action
+if [[ "$action" != "install" && "$action" != "remove" && "$action" != "status" ]]; then
+  echo "Invalid action. Choose 'install', 'remove' or 'status'."
   exit 1
+fi
+
+if [[ "$action" == "status" ]]; then
+  echo "==== GRE Tunnel Status ===="
+  for service in /etc/systemd/system/gre-*-*.service; do
+    [[ -e "$service" ]] || continue
+    service_name=$(basename "$service" .service)
+    tunnel_num=$(echo "$service_name" | grep -oP '[0-9]+$')
+    status=$(systemctl is-active "$service_name")
+    echo "Tunnel $tunnel_num ($service_name): $status"
+  done
+  exit 0
 fi
 
 read -p "Enter tunnel number (1-255): " tunnel_num
