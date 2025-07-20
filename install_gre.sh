@@ -26,6 +26,26 @@ if ! [[ "$tunnel_num" =~ ^[0-9]+$ ]] || ((tunnel_num < 1 || tunnel_num > 255)); 
   exit 1
 fi
 
+if [[ "$action" == "remove" ]]; then
+  echo "[*] Removing GRE tunnel(s) for tunnel number: $tunnel_num"
+
+  for side in ir kh; do
+    gre_name="gre-${side}-${tunnel_num}"
+    unit_file="/etc/systemd/system/${gre_name}.service"
+
+    if [[ -f "$unit_file" ]]; then
+      echo "[*] Found service: $gre_name. Stopping and removing..."
+      systemctl stop "$gre_name" || true
+      systemctl disable "$gre_name" || true
+      rm -f "$unit_file"
+    fi
+  done
+
+  systemctl daemon-reload
+  echo "[+] GRE tunnel(s) with number $tunnel_num removed (if existed)."
+  exit 0
+fi
+
 read -p "Is this server located in Iran? (yes/no): " is_iran
 if [[ "$is_iran" != "yes" && "$is_iran" != "no" ]]; then
   echo "Invalid input for server location."
@@ -49,10 +69,9 @@ ip_remote=$( [[ "$is_iran" == "yes" ]] && echo "$ip_foreign" || echo "$ip_iran" 
 tun_ip=$( [[ "$is_iran" == "yes" ]] && echo "172.17.${tunnel_num}.1/30" || echo "172.17.${tunnel_num}.2/30" )
 unit_file="/etc/systemd/system/${gre_name}.service"
 
-if [[ "$action" == "install" ]]; then
-  echo "[*] Installing GRE tunnel: $gre_name"
+echo "[*] Installing GRE tunnel: $gre_name"
 
-  cat <<EOF > "$unit_file"
+cat <<EOF > "$unit_file"
 [Unit]
 Description=GRE Tunnel $gre_name
 After=network.target
@@ -73,20 +92,8 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reexec
-  systemctl daemon-reload
-  systemctl enable --now "$gre_name"
+systemctl daemon-reexec
+systemctl daemon-reload
+systemctl enable --now "$gre_name"
 
-  echo "[+] Tunnel $gre_name installed and active."
-
-elif [[ "$action" == "remove" ]]; then
-  echo "[*] Removing GRE tunnel: $gre_name"
-
-  systemctl stop "$gre_name" || true
-  systemctl disable "$gre_name" || true
-  rm -f "$unit_file"
-  systemctl daemon-reload
-
-  echo "[+] Tunnel $gre_name removed."
-
-fi
+echo "[+] Tunnel $gre_name installed and active."
