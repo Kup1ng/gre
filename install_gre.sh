@@ -39,6 +39,16 @@ if [[ "$action" == "remove" ]]; then
       systemctl disable "$gre_name" || true
       rm -f "$unit_file"
     fi
+
+    keepalive_name="gre-keepalive-${side}-${tunnel_num}"
+    keepalive_unit="/etc/systemd/system/${keepalive_name}.service"
+
+    if [[ -f "$keepalive_unit" ]]; then
+      echo "[*] Found KeepAlive service: $keepalive_name. Stopping and removing..."
+      systemctl stop "$keepalive_name" || true
+      systemctl disable "$keepalive_name" || true
+      rm -f "$keepalive_unit"
+    fi
   done
 
   systemctl daemon-reload
@@ -61,13 +71,16 @@ if ! [[ "$gre_key" =~ ^[0-9]+$ ]] || ((gre_key < 1 || gre_key > 4294967295)); th
   exit 1
 fi
 
-# Variables
 side_prefix=$( [[ "$is_iran" == "yes" ]] && echo "ir" || echo "kh" )
 gre_name="gre-${side_prefix}-${tunnel_num}"
 ip_local=$( [[ "$is_iran" == "yes" ]] && echo "$ip_iran" || echo "$ip_foreign" )
 ip_remote=$( [[ "$is_iran" == "yes" ]] && echo "$ip_foreign" || echo "$ip_iran" )
 tun_ip=$( [[ "$is_iran" == "yes" ]] && echo "172.17.${tunnel_num}.1/30" || echo "172.17.${tunnel_num}.2/30" )
 unit_file="/etc/systemd/system/${gre_name}.service"
+
+keepalive_name="gre-keepalive-${side_prefix}-${tunnel_num}"
+keepalive_unit="/etc/systemd/system/${keepalive_name}.service"
+ping_ip=$( [[ "$is_iran" == "yes" ]] && echo "172.17.${tunnel_num}.2" || echo "172.17.${tunnel_num}.1" )
 
 echo "[*] Installing GRE tunnel: $gre_name"
 
@@ -92,8 +105,25 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
+cat <<EOF > "$keepalive_unit"
+[Unit]
+Description=GRE KeepAlive $keepalive_name
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/bin/ping -O -i 5 $ping_ip
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 systemctl daemon-reexec
 systemctl daemon-reload
 systemctl enable --now "$gre_name"
+systemctl enable --now "$keepalive_name"
 
 echo "[+] Tunnel $gre_name installed and active."
+echo "[+] KeepAlive service $keepalive_name installed (pinging $ping_ip)."
