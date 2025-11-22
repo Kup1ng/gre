@@ -126,4 +126,4 @@ systemctl enable --now "$gre_name"
 systemctl enable --now "$keepalive_name"
 
 echo "[+] Tunnel $gre_name installed and active."
-echo "[+] KeepAlive service $keepalive_name installed (pinging $ping_ip)."
+echo "[+] KeepAlive service $keepalive_name installed (ping $ping_ip)."
