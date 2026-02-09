@@ -112,7 +112,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/bin/ping -O -i 5 $ping_ip
+ExecStart=/bin/ping -O -i 1 $ping_ip
 Restart=always
 RestartSec=5
 
