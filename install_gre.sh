@@ -105,20 +105,37 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-cat <<EOF > "$keepalive_unit"
+if [[ "$is_iran" == "yes" ]]; then
+  cat <<EOF > "$keepalive_unit"
 [Unit]
 Description=GRE KeepAlive $keepalive_name
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/bin/ping -O -i 1 $ping_ip
+ExecStart=/bin/ping -I $ip_iran -O -i 1 $ping_ip
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
+else
+  cat <<EOF > "$keepalive_unit"
+[Unit]
+Description=GRE KeepAlive $keepalive_name
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/bin/ping -I $ip_foreign -O -i 1 $ping_ip
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+fi
 
 systemctl daemon-reexec
 systemctl daemon-reload
