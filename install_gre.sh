@@ -81,6 +81,7 @@ unit_file="/etc/systemd/system/${gre_name}.service"
 keepalive_name="gre-keepalive-${side_prefix}-${tunnel_num}"
 keepalive_unit="/etc/systemd/system/${keepalive_name}.service"
 ping_ip=$( [[ "$is_iran" == "yes" ]] && echo "172.17.${tunnel_num}.2" || echo "172.17.${tunnel_num}.1" )
+source_ip=$( [[ "$is_iran" == "yes" ]] && echo "172.17.${tunnel_num}.1" || echo "172.17.${tunnel_num}.2" )
 
 echo "[*] Installing GRE tunnel: $gre_name"
 
@@ -105,37 +106,20 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-if [[ "$is_iran" == "yes" ]]; then
-  cat <<EOF > "$keepalive_unit"
+cat <<EOF > "$keepalive_unit"
 [Unit]
 Description=GRE KeepAlive $keepalive_name
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/bin/ping -I $ip_iran -O -i 1 $ping_ip
+ExecStart=/bin/ping -I $source_ip -O -i 1 $ping_ip
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
-else
-  cat <<EOF > "$keepalive_unit"
-[Unit]
-Description=GRE KeepAlive $keepalive_name
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-ExecStart=/bin/ping -I $ip_foreign -O -i 1 $ping_ip
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-fi
 
 systemctl daemon-reexec
 systemctl daemon-reload
