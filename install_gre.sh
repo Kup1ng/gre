@@ -1,5 +1,4 @@
 #!/bin/bash
-
 set -e
 
 read -p "Do you want to install, remove or check status of tunnels? (install/remove/status): " action
@@ -9,24 +8,74 @@ if [[ "$action" != "install" && "$action" != "remove" && "$action" != "status" ]
 fi
 
 if [[ "$action" == "status" ]]; then
-  echo "==== GRE Tunnel Status ===="
+  echo "==== GRE Tunnel Status (tunnel services) ===="
   for service in /etc/systemd/system/gre-*-*.service; do
     [[ -e "$service" ]] || continue
     service_name=$(basename "$service" .service)
-    tunnel_num=$(echo "$service_name" | grep -oP '[0-9]+$')
-    status=$(systemctl is-active "$service_name")
-    echo "Tunnel $tunnel_num ($service_name): $status"
+    tunnel_num=$(echo "$service_name" | grep -oP '[0-9]+$' || true)
+    status=$(systemctl is-active "$service_name" 2>/dev/null || echo "unknown")
+    echo "Tunnel ${tunnel_num:-?} ($service_name): $status"
+  done
+
+  echo
+  echo "==== GRE KeepAlive Status ===="
+  for service in /etc/systemd/system/gre-keepalive-*-*.service; do
+    [[ -e "$service" ]] || continue
+    service_name=$(basename "$service" .service)
+    tunnel_num=$(echo "$service_name" | grep -oP '[0-9]+$' || true)
+    status=$(systemctl is-active "$service_name" 2>/dev/null || echo "unknown")
+    echo "KeepAlive ${tunnel_num:-?} ($service_name): $status"
   done
   exit 0
 fi
 
-read -p "Enter tunnel number (1-255): " tunnel_num
-if ! [[ "$tunnel_num" =~ ^[0-9]+$ ]] || ((tunnel_num < 1 || tunnel_num > 255)); then
-  echo "Invalid tunnel number. Must be between 1 and 255."
-  exit 1
-fi
-
 if [[ "$action" == "remove" ]]; then
+  read -p "Enter tunnel number (1-255) or '@all' to remove everything: " tunnel_sel
+
+  if [[ "$tunnel_sel" == "@all" || "$tunnel_sel" == "all" ]]; then
+    echo "[*] Removing ALL GRE tunnels/services created by this script..."
+
+    # 1) Stop/disable/remove all matching systemd unit files
+    shopt -s nullglob
+
+    units=(/etc/systemd/system/gre-ir-*.service /etc/systemd/system/gre-kh-*.service)
+    ka_units=(/etc/systemd/system/gre-keepalive-ir-*.service /etc/systemd/system/gre-keepalive-kh-*.service)
+
+    for unit in "${units[@]}" "${ka_units[@]}"; do
+      [[ -f "$unit" ]] || continue
+      name=$(basename "$unit" .service)
+      echo "[*] Removing service: $name"
+      systemctl stop "$name" 2>/dev/null || true
+      systemctl disable "$name" 2>/dev/null || true
+      rm -f "$unit"
+    done
+
+    # 2) Best-effort cleanup of leftover ip tunnels that match our naming
+    #    (in case unit files are gone or services weren't running)
+    if command -v ip >/dev/null 2>&1; then
+      while read -r line; do
+        # Example line: gre-ir-10: gre/ip  remote ...
+        tname=$(echo "$line" | awk -F: '{print $1}')
+        if [[ "$tname" =~ ^gre-(ir|kh)-[0-9]+$ ]]; then
+          echo "[*] Deleting leftover tunnel device: $tname"
+          /sbin/ip link set dev "$tname" down 2>/dev/null || true
+          /sbin/ip tunnel del "$tname" 2>/dev/null || true
+        fi
+      done < <(/sbin/ip tunnel show 2>/dev/null || true)
+    fi
+
+    systemctl daemon-reload
+    echo "[+] Done. All matching GRE services and tunnels removed (best effort)."
+    exit 0
+  fi
+
+  # single tunnel number removal (old behavior)
+  tunnel_num="$tunnel_sel"
+  if ! [[ "$tunnel_num" =~ ^[0-9]+$ ]] || ((tunnel_num < 1 || tunnel_num > 255)); then
+    echo "Invalid tunnel number. Must be between 1 and 255, or use '@all'."
+    exit 1
+  fi
+
   echo "[*] Removing GRE tunnel(s) for tunnel number: $tunnel_num"
 
   for side in ir kh; do
@@ -51,9 +100,23 @@ if [[ "$action" == "remove" ]]; then
     fi
   done
 
+  # best-effort delete tunnel device too
+  /sbin/ip link set dev "gre-ir-${tunnel_num}" down 2>/dev/null || true
+  /sbin/ip tunnel del "gre-ir-${tunnel_num}" 2>/dev/null || true
+  /sbin/ip link set dev "gre-kh-${tunnel_num}" down 2>/dev/null || true
+  /sbin/ip tunnel del "gre-kh-${tunnel_num}" 2>/dev/null || true
+
   systemctl daemon-reload
   echo "[+] GRE tunnel(s) with number $tunnel_num removed (if existed)."
   exit 0
+fi
+
+# ===== install flow (unchanged) =====
+
+read -p "Enter tunnel number (1-255): " tunnel_num
+if ! [[ "$tunnel_num" =~ ^[0-9]+$ ]] || ((tunnel_num < 1 || tunnel_num > 255)); then
+  echo "Invalid tunnel number. Must be between 1 and 255."
+  exit 1
 fi
 
 read -p "Is this server located in Iran? (yes/no): " is_iran
