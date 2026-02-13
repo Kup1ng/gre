@@ -1,6 +1,41 @@
 #!/bin/bash
 set -e
 
+# ---------- deps ----------
+ensure_hping3() {
+  if command -v hping3 >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "[*] hping3 not found. Installing..."
+
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y hping3
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y hping3
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y hping3
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -Sy --noconfirm hping3
+  else
+    echo "[!] No supported package manager found. Please install hping3 manually."
+    exit 1
+  fi
+
+  command -v hping3 >/dev/null 2>&1 || { echo "[!] hping3 install failed."; exit 1; }
+  echo "[+] hping3 installed."
+}
+
+HPING3_BIN="$(command -v hping3 2>/dev/null || true)"
+# fallback common paths for embedding in systemd unit (in case PATH differs)
+if [[ -z "$HPING3_BIN" ]]; then
+  for p in /usr/sbin/hping3 /usr/bin/hping3 /sbin/hping3 /bin/hping3; do
+    [[ -x "$p" ]] && HPING3_BIN="$p" && break
+  done
+fi
+
 read -p "Do you want to install, remove or check status of tunnels? (install/remove/status): " action
 if [[ "$action" != "install" && "$action" != "remove" && "$action" != "status" ]]; then
   echo "Invalid action. Choose 'install', 'remove' or 'status'."
@@ -35,9 +70,7 @@ if [[ "$action" == "remove" ]]; then
   if [[ "$tunnel_sel" == "@all" || "$tunnel_sel" == "all" ]]; then
     echo "[*] Removing ALL GRE tunnels/services created by this script..."
 
-    # 1) Stop/disable/remove all matching systemd unit files
     shopt -s nullglob
-
     units=(/etc/systemd/system/gre-ir-*.service /etc/systemd/system/gre-kh-*.service)
     ka_units=(/etc/systemd/system/gre-keepalive-ir-*.service /etc/systemd/system/gre-keepalive-kh-*.service)
 
@@ -50,11 +83,8 @@ if [[ "$action" == "remove" ]]; then
       rm -f "$unit"
     done
 
-    # 2) Best-effort cleanup of leftover ip tunnels that match our naming
-    #    (in case unit files are gone or services weren't running)
     if command -v ip >/dev/null 2>&1; then
       while read -r line; do
-        # Example line: gre-ir-10: gre/ip  remote ...
         tname=$(echo "$line" | awk -F: '{print $1}')
         if [[ "$tname" =~ ^gre-(ir|kh)-[0-9]+$ ]]; then
           echo "[*] Deleting leftover tunnel device: $tname"
@@ -69,7 +99,6 @@ if [[ "$action" == "remove" ]]; then
     exit 0
   fi
 
-  # single tunnel number removal (old behavior)
   tunnel_num="$tunnel_sel"
   if ! [[ "$tunnel_num" =~ ^[0-9]+$ ]] || ((tunnel_num < 1 || tunnel_num > 255)); then
     echo "Invalid tunnel number. Must be between 1 and 255, or use '@all'."
@@ -100,7 +129,6 @@ if [[ "$action" == "remove" ]]; then
     fi
   done
 
-  # best-effort delete tunnel device too
   /sbin/ip link set dev "gre-ir-${tunnel_num}" down 2>/dev/null || true
   /sbin/ip tunnel del "gre-ir-${tunnel_num}" 2>/dev/null || true
   /sbin/ip link set dev "gre-kh-${tunnel_num}" down 2>/dev/null || true
@@ -111,7 +139,11 @@ if [[ "$action" == "remove" ]]; then
   exit 0
 fi
 
-# ===== install flow (unchanged) =====
+# ===== install flow =====
+# make sure we can run keepalive via hping3
+ensure_hping3
+HPING3_BIN="$(command -v hping3)"
+echo "[*] Using hping3: $HPING3_BIN"
 
 read -p "Enter tunnel number (1-255): " tunnel_num
 if ! [[ "$tunnel_num" =~ ^[0-9]+$ ]] || ((tunnel_num < 1 || tunnel_num > 255)); then
@@ -143,8 +175,9 @@ unit_file="/etc/systemd/system/${gre_name}.service"
 
 keepalive_name="gre-keepalive-${side_prefix}-${tunnel_num}"
 keepalive_unit="/etc/systemd/system/${keepalive_name}.service"
+
+# target IP on the GRE /30
 ping_ip=$( [[ "$is_iran" == "yes" ]] && echo "172.17.${tunnel_num}.2" || echo "172.17.${tunnel_num}.1" )
-source_ip=$( [[ "$is_iran" == "yes" ]] && echo "172.17.${tunnel_num}.1" || echo "172.17.${tunnel_num}.2" )
 
 echo "[*] Installing GRE tunnel: $gre_name"
 
@@ -169,6 +202,11 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
+# KeepAlive via hping3 TCP/22, 1 packet per second, bound to GRE interface
+# -I: choose interface (so source uses the GRE address)
+# -S: SYN packets
+# -p 22: dest port 22
+# -i u1000000: 1s interval (microseconds form)  :contentReference[oaicite:3]{index=3}
 cat <<EOF > "$keepalive_unit"
 [Unit]
 Description=GRE KeepAlive $keepalive_name
@@ -176,7 +214,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/bin/ping -I $source_ip -O -i 1 $ping_ip
+ExecStart=$HPING3_BIN -S -p 22 -I $gre_name -i u1000000 $ping_ip
 Restart=always
 RestartSec=5
 
@@ -190,4 +228,4 @@ systemctl enable --now "$gre_name"
 systemctl enable --now "$keepalive_name"
 
 echo "[+] Tunnel $gre_name installed and active."
-echo "[+] KeepAlive service $keepalive_name installed (ping $ping_ip)."
+echo "[+] KeepAlive service $keepalive_name installed (hping3 TCP/22 -> $ping_ip via $gre_name)."
