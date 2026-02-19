@@ -9,6 +9,12 @@ NC='\033[0m'
 DEFAULT_KEY="2749365187"
 DEFAULT_MTU="1472"
 
+# Status ping settings
+PING_COUNT=100
+PING_INTERVAL="0.1"
+PING_TIMEOUT="1"
+PING_DEADLINE="12"
+
 die() { echo "Error: $*" >&2; exit 1; }
 
 is_num_1_255() {
@@ -166,12 +172,13 @@ calc_peer_ip() {
 ping_loss_pct() {
   local src_ip="$1"
   local dst_ip="$2"
-  local out rc loss
+  local out loss
 
-  set +e
-  out=$(/bin/ping -c 10 -W 1 -I "$src_ip" "$dst_ip" 2>/dev/null)
-  rc=$?
-  set -e
+  # -c: count
+  # -i: interval
+  # -W: per-packet timeout (seconds)
+  # -w: overall deadline (seconds)
+  out=$(/bin/ping -c "$PING_COUNT" -i "$PING_INTERVAL" -W "$PING_TIMEOUT" -w "$PING_DEADLINE" -I "$src_ip" "$dst_ip" 2>/dev/null || true)
 
   loss=$(echo "$out" | awk -F',' '/packet loss/ {gsub(/%/,"",$3); gsub(/ /,"",$3); print $3}' | head -n1)
   if [[ -z "${loss:-}" ]]; then
@@ -179,14 +186,12 @@ ping_loss_pct() {
     return 0
   fi
 
-  # integer normalize
   loss="${loss%%.*}"
   if ! [[ "$loss" =~ ^[0-9]+$ ]]; then
     echo "100"
     return 0
   fi
 
-  # if ping failed badly and loss looks weird, clamp
   if (( loss < 0 )); then loss=0; fi
   if (( loss > 100 )); then loss=100; fi
 
@@ -221,12 +226,12 @@ status_ping_all() {
   for ifc in "${ifaces[@]}"; do
     (
       local tid local_tun_ip dst_ip link_line local_pub peer_pub
-      local peer_loss dst_loss detail color_detail
+      local peer_loss dst_loss detail
+      local peer_file dst_file max_loss
 
       tid=$(echo "$ifc" | sed -E 's/^gre-(ir|kh)-([0-9]+)$/\2/')
       [[ -n "$tid" ]] || tid="$ifc"
 
-      # Tunnel local IPv4 (172.17.x.1 or 109.194.x.1 etc.)
       local_tun_ip=$(/sbin/ip -o -4 addr show dev "$ifc" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)
       if [[ -z "$local_tun_ip" ]]; then
         echo -e "${tid}\t-\t(100%)\t-\t(100%)\t${RED}DC${NC}" > "$tmpdir/$ifc"
@@ -235,30 +240,32 @@ status_ping_all() {
 
       dst_ip=$(calc_peer_ip "$local_tun_ip")
       if [[ -z "$dst_ip" ]]; then
-        echo -e "${tid}\t-\t(100%)\t${dst_ip:--}\t(100%)\t${RED}DC${NC}" > "$tmpdir/$ifc"
+        echo -e "${tid}\t-\t(100%)\t-\t(100%)\t${RED}DC${NC}" > "$tmpdir/$ifc"
         exit 0
       fi
 
-      # Public peer from ip -d link show: "link/gre <local_pub> peer <peer_pub>"
       link_line=$(/sbin/ip -d link show "$ifc" 2>/dev/null | awk '/link\/gre/ {print; exit}' || true)
       local_pub=$(echo "$link_line" | awk '{print $2}')
       peer_pub=$(echo "$link_line" | awk '{for (i=1;i<=NF;i++) if ($i=="peer") {print $(i+1); exit}}')
 
-      # If public peer not found, still compute dst ping
-      if [[ -z "${local_pub:-}" || -z "${peer_pub:-}" ]]; then
-        peer_pub="-"
-        peer_loss=100
+      peer_file="$tmpdir/${ifc}.peer"
+      dst_file="$tmpdir/${ifc}.dst"
+
+      # Peer ping and dst ping in parallel (and all ifaces are parallel too)
+      if [[ -n "${local_pub:-}" && -n "${peer_pub:-}" ]]; then
+        ping_loss_pct "$local_pub" "$peer_pub" > "$peer_file" &
       else
-        peer_loss=$(ping_loss_pct "$local_pub" "$peer_pub")
+        echo "100" > "$peer_file" &
+        peer_pub="-"
       fi
 
-      dst_loss=$(ping_loss_pct "$local_tun_ip" "$dst_ip")
+      ping_loss_pct "$local_tun_ip" "$dst_ip" > "$dst_file" &
 
-      # DETAIL logic:
-      # - If either is 100% => DC (red)
-      # - Else if either >20% => Warning (yellow) with max loss
-      # - Else if both <10% => Connected (green)
-      # - Else => Connected (green) (loss is already shown in columns)
+      wait
+
+      peer_loss=$(cat "$peer_file" 2>/dev/null || echo "100")
+      dst_loss=$(cat "$dst_file" 2>/dev/null || echo "100")
+
       if (( peer_loss >= 100 || dst_loss >= 100 )); then
         detail="${RED}DC${NC}"
       else
