@@ -15,6 +15,86 @@ is_num_1_255() {
   [[ "${1:-}" =~ ^[0-9]+$ ]] && (( 1 <= 10#$1 && 10#$1 <= 255 ))
 }
 
+tunnel_num_exists() {
+  local n="$1"
+
+  # Any existing unit file for this tunnel number?
+  if [[ -f "/etc/systemd/system/gre-ir-${n}.service" || -f "/etc/systemd/system/gre-kh-${n}.service" ]]; then
+    return 0
+  fi
+
+  # Any existing interface for this tunnel number?
+  if /sbin/ip link show "gre-ir-${n}" >/dev/null 2>&1 || /sbin/ip link show "gre-kh-${n}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # Any tunnel with this name in ip tunnel?
+  if /sbin/ip tunnel show 2>/dev/null | grep -qE "^(gre-ir-${n}|gre-kh-${n}):"; then
+    return 0
+  fi
+
+  return 1
+}
+
+extract_local_remote_from_unit() {
+  # Prints: "<local> <remote>" or empty
+  local unit_file="$1"
+  local line local_ip remote_ip
+
+  line=$(grep -E '^ExecStart=/sbin/ip tunnel add ' "$unit_file" 2>/dev/null | head -n1 || true)
+  [[ -n "$line" ]] || return 1
+
+  local_ip=$(echo "$line" | awk '{for (i=1;i<=NF;i++) if ($i=="local") {print $(i+1); exit}}')
+  remote_ip=$(echo "$line" | awk '{for (i=1;i<=NF;i++) if ($i=="remote") {print $(i+1); exit}}')
+
+  [[ -n "${local_ip:-}" && -n "${remote_ip:-}" ]] || return 1
+  echo "$local_ip $remote_ip"
+  return 0
+}
+
+find_duplicate_endpoints() {
+  # If existing tunnel has same endpoints in any direction, print its tunnel number and return 0.
+  # Otherwise return 1.
+  local ip_iran="$1"
+  local ip_foreign="$2"
+
+  shopt -s nullglob
+  local f pair local_ip remote_ip
+
+  for f in /etc/systemd/system/gre-ir-*.service /etc/systemd/system/gre-kh-*.service; do
+    [[ -f "$f" ]] || continue
+    pair=$(extract_local_remote_from_unit "$f" || true)
+    [[ -n "$pair" ]] || continue
+
+    local_ip="${pair%% *}"
+    remote_ip="${pair##* }"
+
+    if { [[ "$local_ip" == "$ip_iran" && "$remote_ip" == "$ip_foreign" ]] || \
+         [[ "$local_ip" == "$ip_foreign" && "$remote_ip" == "$ip_iran" ]]; }; then
+      # Get tunnel number from filename: gre-<side>-<num>.service
+      basename "$f" | sed -E 's/^gre-(ir|kh)-([0-9]+)\.service$/\2/'
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+preinstall_conflict_checks() {
+  local tunnel_num="$1"
+  local ip_iran="$2"
+  local ip_foreign="$3"
+
+  if tunnel_num_exists "$tunnel_num"; then
+    die "Tunnel number ${tunnel_num} already exists. Aborting to avoid conflicts."
+  fi
+
+  local dup_num
+  if dup_num=$(find_duplicate_endpoints "$ip_iran" "$ip_foreign"); then
+    die "Duplicate endpoints detected. You are trying to create the same Iran/Foreign IP pair as tunnel number ${dup_num}. Aborting."
+  fi
+}
+
 remove_one_tunnel() {
   local tunnel_num="$1"
   echo "[*] Removing GRE tunnel(s) for tunnel number: $tunnel_num"
@@ -111,7 +191,7 @@ status_ping_all() {
 
   for ifc in "${ifaces[@]}"; do
     (
-      local local_ip peer_ip loss
+      local local_ip peer_ip loss out rc loss_int
       local_ip=$(/sbin/ip -o -4 addr show dev "$ifc" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)
       if [[ -z "$local_ip" ]]; then
         echo -e "${ifc}\t-\t${RED}DOWN${NC}\t(no IPv4 on iface)" > "$tmpdir/$ifc"
@@ -124,7 +204,6 @@ status_ping_all() {
         exit 0
       fi
 
-      # 10 pings, short wait; keep output to parse packet loss
       set +e
       out=$(/bin/ping -c 10 -W 1 -I "$local_ip" "$peer_ip" 2>/dev/null)
       rc=$?
@@ -132,14 +211,12 @@ status_ping_all() {
 
       loss=$(echo "$out" | awk -F',' '/packet loss/ {gsub(/%/,"",$3); gsub(/ /,"",$3); print $3}' | head -n1)
       if [[ -z "${loss:-}" ]]; then
-        # If ping output is missing, treat as down
         echo -e "${ifc}\t$peer_ip\t${RED}DOWN${NC}\t(unknown)" > "$tmpdir/$ifc"
         exit 0
       fi
 
-      # normalize to integer
       loss_int=${loss%%.*}
-      if (( loss_int >= 100 || rc != 0 && loss_int == 100 )); then
+      if (( loss_int >= 100 || (rc != 0 && loss_int == 100) )); then
         echo -e "${ifc}\t$peer_ip\t${RED}DOWN${NC}\t(${loss}% loss)" > "$tmpdir/$ifc"
       elif (( loss_int >= 10 )); then
         echo -e "${ifc}\t$peer_ip\t${YELLOW}UP${NC}\t(${loss}% loss)" > "$tmpdir/$ifc"
@@ -151,7 +228,6 @@ status_ping_all() {
 
   wait
 
-  # Print in a stable order by tunnel number
   {
     for f in "$tmpdir"/gre-*; do
       [[ -f "$f" ]] || continue
@@ -175,6 +251,9 @@ install_flow() {
   [[ -n "$ip_iran" ]] || die "Iran server IP is required."
   read -rp "Enter Foreign server IP: " ip_foreign
   [[ -n "$ip_foreign" ]] || die "Foreign server IP is required."
+
+  # Safety checks (must happen before writing any unit files)
+  preinstall_conflict_checks "$tunnel_num" "$ip_iran" "$ip_foreign"
 
   read -rp "Enter GRE key (1-4294967295) [${DEFAULT_KEY}]: " gre_key
   gre_key="${gre_key:-$DEFAULT_KEY}"
@@ -289,7 +368,6 @@ main_menu() {
         exit 0
       fi
 
-      # Split by comma and remove each unique, valid number
       IFS=',' read -r -a nums <<< "$tunnel_sel"
       (( ${#nums[@]} > 0 )) || die "No tunnel numbers provided."
 
