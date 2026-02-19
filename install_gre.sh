@@ -171,12 +171,19 @@ calc_peer_ip() {
 status_ping_all() {
   shopt -s nullglob
 
+  # Collect GRE interfaces, stripping any @suffix (e.g. gre-ir-6@NONE -> gre-ir-6)
   local ifaces=()
   local s
   while read -r s; do
     [[ -n "$s" ]] || continue
+    s="${s%%@*}"  # strip @...
     ifaces+=("$s")
-  done < <(/sbin/ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^gre-(ir|kh)-[0-9]+$' || true)
+  done < <(
+    /sbin/ip -o link show 2>/dev/null \
+      | awk -F': ' '{print $2}' \
+      | grep -E '^gre-(ir|kh)-[0-9]+' \
+      | sort -u
+  )
 
   if (( ${#ifaces[@]} == 0 )); then
     echo "No GRE interfaces found."
@@ -192,6 +199,8 @@ status_ping_all() {
   for ifc in "${ifaces[@]}"; do
     (
       local local_ip peer_ip loss out rc loss_int
+
+      # Get local IPv4 on this iface
       local_ip=$(/sbin/ip -o -4 addr show dev "$ifc" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)
       if [[ -z "$local_ip" ]]; then
         echo -e "${ifc}\t-\t${RED}DOWN${NC}\t(no IPv4 on iface)" > "$tmpdir/$ifc"
@@ -204,6 +213,7 @@ status_ping_all() {
         exit 0
       fi
 
+      # 10 pings in parallel jobs
       set +e
       out=$(/bin/ping -c 10 -W 1 -I "$local_ip" "$peer_ip" 2>/dev/null)
       rc=$?
@@ -216,6 +226,7 @@ status_ping_all() {
       fi
 
       loss_int=${loss%%.*}
+
       if (( loss_int >= 100 || (rc != 0 && loss_int == 100) )); then
         echo -e "${ifc}\t$peer_ip\t${RED}DOWN${NC}\t(${loss}% loss)" > "$tmpdir/$ifc"
       elif (( loss_int >= 10 )); then
