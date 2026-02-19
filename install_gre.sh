@@ -314,18 +314,28 @@ install_flow() {
     die "Invalid MTU. Use a number between 576 and 9000."
   fi
 
-  echo "Select tunnel IP range:"
-  echo "  1) Private (172.17.<tunnel>.0/30)"
-  echo "  2) Public  (109.194.<tunnel>.0/30)"
-  read -rp "Choice [1-2]: " range_choice
-  [[ "$range_choice" == "1" || "$range_choice" == "2" ]] || die "Invalid range choice."
+    echo "Select tunnel IP range:"
+    echo "  1) Private (172.17.<tunnel>.0/30)"
+    echo "  2) Public"
+    read -rp "Choice [1-2]: " range_choice
+    [[ "$range_choice" == "1" || "$range_choice" == "2" ]] || die "Invalid range choice."
 
-  local base_prefix
-  if [[ "$range_choice" == "1" ]]; then
-    base_prefix="172.17"
-  else
-    base_prefix="109.194"
-  fi
+    local base_prefix=""
+    if [[ "$range_choice" == "1" ]]; then
+      base_prefix="172.17"
+    else
+      # Public prefixes list (extendable)
+      local -a pub_prefixes=("109.194" "87.107")
+      echo "Select public range:"
+      local i
+      for i in "${!pub_prefixes[@]}"; do
+        echo "  $((i+1))) ${pub_prefixes[$i]}.<tunnel>.0/30"
+      done
+      read -rp "Choice [1-${#pub_prefixes[@]}]: " pub_choice
+      [[ "$pub_choice" =~ ^[0-9]+$ ]] || die "Invalid public range choice."
+      (( pub_choice >= 1 && pub_choice <= ${#pub_prefixes[@]} )) || die "Invalid public range choice."
+      base_prefix="${pub_prefixes[$((pub_choice-1))]}"
+    fi
 
   local gre_name="gre-${side_prefix}-${tunnel_num}"
   local unit_file="/etc/systemd/system/${gre_name}.service"
