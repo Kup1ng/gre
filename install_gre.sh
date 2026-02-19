@@ -174,10 +174,6 @@ ping_loss_pct() {
   local dst_ip="$2"
   local out loss
 
-  # -c: count
-  # -i: interval
-  # -W: per-packet timeout (seconds)
-  # -w: overall deadline (seconds)
   out=$(/bin/ping -c "$PING_COUNT" -i "$PING_INTERVAL" -W "$PING_TIMEOUT" -w "$PING_DEADLINE" -I "$src_ip" "$dst_ip" 2>/dev/null || true)
 
   loss=$(echo "$out" | awk -F',' '/packet loss/ {gsub(/%/,"",$3); gsub(/ /,"",$3); print $3}' | head -n1)
@@ -192,9 +188,8 @@ ping_loss_pct() {
     return 0
   fi
 
-  if (( loss < 0 )); then loss=0; fi
-  if (( loss > 100 )); then loss=100; fi
-
+  (( loss < 0 )) && loss=0
+  (( loss > 100 )) && loss=100
   echo "$loss"
 }
 
@@ -208,10 +203,7 @@ status_ping_all() {
     s="${s%%@*}"
     ifaces+=("$s")
   done < <(
-    /sbin/ip -o link show 2>/dev/null \
-      | awk -F': ' '{print $2}' \
-      | grep -E '^gre-(ir|kh)-[0-9]+' \
-      | sort -u
+    /sbin/ip -o link show 2>/dev/null       | awk -F': ' '{print $2}'       | grep -E '^gre-(ir|kh)-[0-9]+'       | sort -u
   )
 
   if (( ${#ifaces[@]} == 0 )); then
@@ -221,26 +213,26 @@ status_ping_all() {
 
   local tmpdir
   tmpdir=$(mktemp -d)
-  trap 'rm -rf "$tmpdir"' EXIT
+  trap 'rm -rf "${tmpdir:-}"' EXIT
 
   for ifc in "${ifaces[@]}"; do
     (
       local tid local_tun_ip dst_ip link_line local_pub peer_pub
-      local peer_loss dst_loss detail
-      local peer_file dst_file max_loss
+      local peer_loss dst_loss detail max_loss
+      local peer_file dst_file row_file
 
       tid=$(echo "$ifc" | sed -E 's/^gre-(ir|kh)-([0-9]+)$/\2/')
       [[ -n "$tid" ]] || tid="$ifc"
 
       local_tun_ip=$(/sbin/ip -o -4 addr show dev "$ifc" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)
       if [[ -z "$local_tun_ip" ]]; then
-        echo -e "${tid}\t-\t(100%)\t-\t(100%)\t${RED}DC${NC}" > "$tmpdir/$ifc"
+        echo -e "${tid}\t-\t(100%)\t-\t(100%)\t${RED}DC${NC}" > "$tmpdir/row_${tid}"
         exit 0
       fi
 
       dst_ip=$(calc_peer_ip "$local_tun_ip")
       if [[ -z "$dst_ip" ]]; then
-        echo -e "${tid}\t-\t(100%)\t-\t(100%)\t${RED}DC${NC}" > "$tmpdir/$ifc"
+        echo -e "${tid}\t-\t(100%)\t-\t(100%)\t${RED}DC${NC}" > "$tmpdir/row_${tid}"
         exit 0
       fi
 
@@ -248,15 +240,15 @@ status_ping_all() {
       local_pub=$(echo "$link_line" | awk '{print $2}')
       peer_pub=$(echo "$link_line" | awk '{for (i=1;i<=NF;i++) if ($i=="peer") {print $(i+1); exit}}')
 
-      peer_file="$tmpdir/${ifc}.peer"
-      dst_file="$tmpdir/${ifc}.dst"
+      peer_file="$tmpdir/.peer_${tid}"
+      dst_file="$tmpdir/.dst_${tid}"
+      row_file="$tmpdir/row_${tid}"
 
-      # Peer ping and dst ping in parallel (and all ifaces are parallel too)
       if [[ -n "${local_pub:-}" && -n "${peer_pub:-}" ]]; then
         ping_loss_pct "$local_pub" "$peer_pub" > "$peer_file" &
       else
-        echo "100" > "$peer_file" &
         peer_pub="-"
+        echo "100" > "$peer_file" &
       fi
 
       ping_loss_pct "$local_tun_ip" "$dst_ip" > "$dst_file" &
@@ -278,14 +270,14 @@ status_ping_all() {
         fi
       fi
 
-      echo -e "${tid}\t${peer_pub}\t(${peer_loss}%)\t${dst_ip}\t(${dst_loss}%)\t${detail}" > "$tmpdir/$ifc"
+      echo -e "${tid}\t${peer_pub}\t(${peer_loss}%)\t${dst_ip}\t(${dst_loss}%)\t${detail}" > "$row_file"
     ) &
   done
 
   wait
 
   {
-    for f in "$tmpdir"/gre-*; do
+    for f in "$tmpdir"/row_*; do
       [[ -f "$f" ]] || continue
       cat "$f"
     done
