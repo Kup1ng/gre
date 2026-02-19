@@ -23,8 +23,8 @@ tunnel_num_exists() {
     return 0
   fi
 
-  # Any existing interface for this tunnel number?
-  if /sbin/ip link show "gre-ir-${n}" >/dev/null 2>&1 || /sbin/ip link show "gre-kh-${n}" >/dev/null 2>&1; then
+  # Any existing interface for this tunnel number? (handles @NONE suffix)
+  if /sbin/ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -qE "^gre-(ir|kh)-${n}(@|$)"; then
     return 0
   fi
 
@@ -52,7 +52,7 @@ extract_local_remote_from_unit() {
   return 0
 }
 
-find_duplicate_endpoints() {
+find_duplicate_endpoints_from_units() {
   # If existing tunnel has same endpoints in any direction, print its tunnel number and return 0.
   # Otherwise return 1.
   local ip_iran="$1"
@@ -71,11 +71,41 @@ find_duplicate_endpoints() {
 
     if { [[ "$local_ip" == "$ip_iran" && "$remote_ip" == "$ip_foreign" ]] || \
          [[ "$local_ip" == "$ip_foreign" && "$remote_ip" == "$ip_iran" ]]; }; then
-      # Get tunnel number from filename: gre-<side>-<num>.service
       basename "$f" | sed -E 's/^gre-(ir|kh)-([0-9]+)\.service$/\2/'
       return 0
     fi
   done
+
+  return 1
+}
+
+find_duplicate_endpoints_from_live_links() {
+  # Scans existing GRE interfaces (even without systemd units) and compares local/peer endpoints.
+  # If duplicate found, prints tunnel number and returns 0, else return 1.
+  local ip_iran="$1"
+  local ip_foreign="$2"
+
+  local ifc line local_ip remote_ip tn
+  while read -r ifc; do
+    [[ -n "$ifc" ]] || continue
+    ifc="${ifc%%@*}"
+
+    # Example line: "link/gre 185.212.50.74 peer 65.109.141.242"
+    line=$(/sbin/ip -d link show "$ifc" 2>/dev/null | awk '/link\/gre/ {print; exit}' || true)
+    [[ -n "$line" ]] || continue
+
+    local_ip=$(echo "$line" | awk '{print $2}')
+    remote_ip=$(echo "$line" | awk '{for (i=1;i<=NF;i++) if ($i=="peer") {print $(i+1); exit}}')
+    [[ -n "${local_ip:-}" && -n "${remote_ip:-}" ]] || continue
+
+    if { [[ "$local_ip" == "$ip_iran" && "$remote_ip" == "$ip_foreign" ]] || \
+         [[ "$local_ip" == "$ip_foreign" && "$remote_ip" == "$ip_iran" ]]; }; then
+      tn=$(echo "$ifc" | sed -E 's/^gre-(ir|kh)-([0-9]+)$/\2/')
+      [[ -n "$tn" ]] || tn="unknown"
+      echo "$tn"
+      return 0
+    fi
+  done < <(/sbin/ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^gre-(ir|kh)-[0-9]+' | sort -u)
 
   return 1
 }
@@ -90,8 +120,12 @@ preinstall_conflict_checks() {
   fi
 
   local dup_num
-  if dup_num=$(find_duplicate_endpoints "$ip_iran" "$ip_foreign"); then
+  if dup_num=$(find_duplicate_endpoints_from_units "$ip_iran" "$ip_foreign"); then
     die "Duplicate endpoints detected. You are trying to create the same Iran/Foreign IP pair as tunnel number ${dup_num}. Aborting."
+  fi
+
+  if dup_num=$(find_duplicate_endpoints_from_live_links "$ip_iran" "$ip_foreign"); then
+    die "Duplicate endpoints detected (live interface). You are trying to create the same Iran/Foreign IP pair as tunnel number ${dup_num}. Aborting."
   fi
 }
 
@@ -171,12 +205,11 @@ calc_peer_ip() {
 status_ping_all() {
   shopt -s nullglob
 
-  # Collect GRE interfaces, stripping any @suffix (e.g. gre-ir-6@NONE -> gre-ir-6)
   local ifaces=()
   local s
   while read -r s; do
     [[ -n "$s" ]] || continue
-    s="${s%%@*}"  # strip @...
+    s="${s%%@*}"
     ifaces+=("$s")
   done < <(
     /sbin/ip -o link show 2>/dev/null \
@@ -200,7 +233,6 @@ status_ping_all() {
     (
       local local_ip peer_ip loss out rc loss_int
 
-      # Get local IPv4 on this iface
       local_ip=$(/sbin/ip -o -4 addr show dev "$ifc" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)
       if [[ -z "$local_ip" ]]; then
         echo -e "${ifc}\t-\t${RED}DOWN${NC}\t(no IPv4 on iface)" > "$tmpdir/$ifc"
@@ -213,7 +245,6 @@ status_ping_all() {
         exit 0
       fi
 
-      # 10 pings in parallel jobs
       set +e
       out=$(/bin/ping -c 10 -W 1 -I "$local_ip" "$peer_ip" 2>/dev/null)
       rc=$?
@@ -263,7 +294,6 @@ install_flow() {
   read -rp "Enter Foreign server IP: " ip_foreign
   [[ -n "$ip_foreign" ]] || die "Foreign server IP is required."
 
-  # Safety checks (must happen before writing any unit files)
   preinstall_conflict_checks "$tunnel_num" "$ip_iran" "$ip_foreign"
 
   read -rp "Enter GRE key (1-4294967295) [${DEFAULT_KEY}]: " gre_key
