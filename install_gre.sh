@@ -15,20 +15,18 @@ is_num_1_255() {
   [[ "${1:-}" =~ ^[0-9]+$ ]] && (( 1 <= 10#$1 && 10#$1 <= 255 ))
 }
 
+# Fix: detect existing links even when shown as gre-ir-7@NONE
 tunnel_num_exists() {
   local n="$1"
 
-  # Any existing unit file for this tunnel number?
   if [[ -f "/etc/systemd/system/gre-ir-${n}.service" || -f "/etc/systemd/system/gre-kh-${n}.service" ]]; then
     return 0
   fi
 
-  # Any existing interface for this tunnel number? (handles @NONE suffix)
   if /sbin/ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -qE "^gre-(ir|kh)-${n}(@|$)"; then
     return 0
   fi
 
-  # Any tunnel with this name in ip tunnel?
   if /sbin/ip tunnel show 2>/dev/null | grep -qE "^(gre-ir-${n}|gre-kh-${n}):"; then
     return 0
   fi
@@ -37,7 +35,6 @@ tunnel_num_exists() {
 }
 
 extract_local_remote_from_unit() {
-  # Prints: "<local> <remote>" or empty
   local unit_file="$1"
   local line local_ip remote_ip
 
@@ -52,9 +49,7 @@ extract_local_remote_from_unit() {
   return 0
 }
 
-find_duplicate_endpoints_from_units() {
-  # If existing tunnel has same endpoints in any direction, print its tunnel number and return 0.
-  # Otherwise return 1.
+find_duplicate_endpoints() {
   local ip_iran="$1"
   local ip_foreign="$2"
 
@@ -79,37 +74,6 @@ find_duplicate_endpoints_from_units() {
   return 1
 }
 
-find_duplicate_endpoints_from_live_links() {
-  # Scans existing GRE interfaces (even without systemd units) and compares local/peer endpoints.
-  # If duplicate found, prints tunnel number and returns 0, else return 1.
-  local ip_iran="$1"
-  local ip_foreign="$2"
-
-  local ifc line local_ip remote_ip tn
-  while read -r ifc; do
-    [[ -n "$ifc" ]] || continue
-    ifc="${ifc%%@*}"
-
-    # Example line: "link/gre 185.212.50.74 peer 65.109.141.242"
-    line=$(/sbin/ip -d link show "$ifc" 2>/dev/null | awk '/link\/gre/ {print; exit}' || true)
-    [[ -n "$line" ]] || continue
-
-    local_ip=$(echo "$line" | awk '{print $2}')
-    remote_ip=$(echo "$line" | awk '{for (i=1;i<=NF;i++) if ($i=="peer") {print $(i+1); exit}}')
-    [[ -n "${local_ip:-}" && -n "${remote_ip:-}" ]] || continue
-
-    if { [[ "$local_ip" == "$ip_iran" && "$remote_ip" == "$ip_foreign" ]] || \
-         [[ "$local_ip" == "$ip_foreign" && "$remote_ip" == "$ip_iran" ]]; }; then
-      tn=$(echo "$ifc" | sed -E 's/^gre-(ir|kh)-([0-9]+)$/\2/')
-      [[ -n "$tn" ]] || tn="unknown"
-      echo "$tn"
-      return 0
-    fi
-  done < <(/sbin/ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^gre-(ir|kh)-[0-9]+' | sort -u)
-
-  return 1
-}
-
 preinstall_conflict_checks() {
   local tunnel_num="$1"
   local ip_iran="$2"
@@ -120,12 +84,8 @@ preinstall_conflict_checks() {
   fi
 
   local dup_num
-  if dup_num=$(find_duplicate_endpoints_from_units "$ip_iran" "$ip_foreign"); then
+  if dup_num=$(find_duplicate_endpoints "$ip_iran" "$ip_foreign"); then
     die "Duplicate endpoints detected. You are trying to create the same Iran/Foreign IP pair as tunnel number ${dup_num}. Aborting."
-  fi
-
-  if dup_num=$(find_duplicate_endpoints_from_live_links "$ip_iran" "$ip_foreign"); then
-    die "Duplicate endpoints detected (live interface). You are trying to create the same Iran/Foreign IP pair as tunnel number ${dup_num}. Aborting."
   fi
 }
 
@@ -202,6 +162,37 @@ calc_peer_ip() {
   fi
 }
 
+# Return integer loss percent (0-100). If unknown => 100.
+ping_loss_pct() {
+  local src_ip="$1"
+  local dst_ip="$2"
+  local out rc loss
+
+  set +e
+  out=$(/bin/ping -c 10 -W 1 -I "$src_ip" "$dst_ip" 2>/dev/null)
+  rc=$?
+  set -e
+
+  loss=$(echo "$out" | awk -F',' '/packet loss/ {gsub(/%/,"",$3); gsub(/ /,"",$3); print $3}' | head -n1)
+  if [[ -z "${loss:-}" ]]; then
+    echo "100"
+    return 0
+  fi
+
+  # integer normalize
+  loss="${loss%%.*}"
+  if ! [[ "$loss" =~ ^[0-9]+$ ]]; then
+    echo "100"
+    return 0
+  fi
+
+  # if ping failed badly and loss looks weird, clamp
+  if (( loss < 0 )); then loss=0; fi
+  if (( loss > 100 )); then loss=100; fi
+
+  echo "$loss"
+}
+
 status_ping_all() {
   shopt -s nullglob
 
@@ -227,44 +218,60 @@ status_ping_all() {
   tmpdir=$(mktemp -d)
   trap 'rm -rf "$tmpdir"' EXIT
 
-  echo "==== GRE Ping Status (parallel, 10 pings each) ===="
-
   for ifc in "${ifaces[@]}"; do
     (
-      local local_ip peer_ip loss out rc loss_int
+      local tid local_tun_ip dst_ip link_line local_pub peer_pub
+      local peer_loss dst_loss detail color_detail
 
-      local_ip=$(/sbin/ip -o -4 addr show dev "$ifc" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)
-      if [[ -z "$local_ip" ]]; then
-        echo -e "${ifc}\t-\t${RED}DOWN${NC}\t(no IPv4 on iface)" > "$tmpdir/$ifc"
+      tid=$(echo "$ifc" | sed -E 's/^gre-(ir|kh)-([0-9]+)$/\2/')
+      [[ -n "$tid" ]] || tid="$ifc"
+
+      # Tunnel local IPv4 (172.17.x.1 or 109.194.x.1 etc.)
+      local_tun_ip=$(/sbin/ip -o -4 addr show dev "$ifc" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)
+      if [[ -z "$local_tun_ip" ]]; then
+        echo -e "${tid}\t-\t(100%)\t-\t(100%)\t${RED}DC${NC}" > "$tmpdir/$ifc"
         exit 0
       fi
 
-      peer_ip=$(calc_peer_ip "$local_ip")
-      if [[ -z "$peer_ip" ]]; then
-        echo -e "${ifc}\t$local_ip\t${YELLOW}UNKNOWN${NC}\t(peer ip not derivable)" > "$tmpdir/$ifc"
+      dst_ip=$(calc_peer_ip "$local_tun_ip")
+      if [[ -z "$dst_ip" ]]; then
+        echo -e "${tid}\t-\t(100%)\t${dst_ip:--}\t(100%)\t${RED}DC${NC}" > "$tmpdir/$ifc"
         exit 0
       fi
 
-      set +e
-      out=$(/bin/ping -c 10 -W 1 -I "$local_ip" "$peer_ip" 2>/dev/null)
-      rc=$?
-      set -e
+      # Public peer from ip -d link show: "link/gre <local_pub> peer <peer_pub>"
+      link_line=$(/sbin/ip -d link show "$ifc" 2>/dev/null | awk '/link\/gre/ {print; exit}' || true)
+      local_pub=$(echo "$link_line" | awk '{print $2}')
+      peer_pub=$(echo "$link_line" | awk '{for (i=1;i<=NF;i++) if ($i=="peer") {print $(i+1); exit}}')
 
-      loss=$(echo "$out" | awk -F',' '/packet loss/ {gsub(/%/,"",$3); gsub(/ /,"",$3); print $3}' | head -n1)
-      if [[ -z "${loss:-}" ]]; then
-        echo -e "${ifc}\t$peer_ip\t${RED}DOWN${NC}\t(unknown)" > "$tmpdir/$ifc"
-        exit 0
-      fi
-
-      loss_int=${loss%%.*}
-
-      if (( loss_int >= 100 || (rc != 0 && loss_int == 100) )); then
-        echo -e "${ifc}\t$peer_ip\t${RED}DOWN${NC}\t(${loss}% loss)" > "$tmpdir/$ifc"
-      elif (( loss_int >= 10 )); then
-        echo -e "${ifc}\t$peer_ip\t${YELLOW}UP${NC}\t(${loss}% loss)" > "$tmpdir/$ifc"
+      # If public peer not found, still compute dst ping
+      if [[ -z "${local_pub:-}" || -z "${peer_pub:-}" ]]; then
+        peer_pub="-"
+        peer_loss=100
       else
-        echo -e "${ifc}\t$peer_ip\t${GREEN}UP${NC}\t(${loss}% loss)" > "$tmpdir/$ifc"
+        peer_loss=$(ping_loss_pct "$local_pub" "$peer_pub")
       fi
+
+      dst_loss=$(ping_loss_pct "$local_tun_ip" "$dst_ip")
+
+      # DETAIL logic:
+      # - If either is 100% => DC (red)
+      # - Else if either >20% => Warning (yellow) with max loss
+      # - Else if both <10% => Connected (green)
+      # - Else => Connected (green) (loss is already shown in columns)
+      if (( peer_loss >= 100 || dst_loss >= 100 )); then
+        detail="${RED}DC${NC}"
+      else
+        if (( peer_loss > 20 || dst_loss > 20 )); then
+          max_loss=$peer_loss
+          (( dst_loss > max_loss )) && max_loss=$dst_loss
+          detail="${YELLOW}Warning (${max_loss}%)${NC}"
+        else
+          detail="${GREEN}Connected${NC}"
+        fi
+      fi
+
+      echo -e "${tid}\t${peer_pub}\t(${peer_loss}%)\t${dst_ip}\t(${dst_loss}%)\t${detail}" > "$tmpdir/$ifc"
     ) &
   done
 
@@ -275,11 +282,11 @@ status_ping_all() {
       [[ -f "$f" ]] || continue
       cat "$f"
     done
-  } | sort -t$'\t' -k1,1V | awk -F'\t' 'BEGIN{
-      printf "%-18s %-18s %-10s %s\n","IFACE","PEER_IP","STATUS","DETAIL"
-      printf "%-18s %-18s %-10s %s\n","------------------","------------------","----------","------------------------------"
+  } | sort -t$'\t' -k1,1n | awk -F'\t' 'BEGIN{
+      printf "%-6s %-16s %-7s %-16s %-7s %s\n","IFACE","PEER_IP","STAT","DST_IP","STAT","DETAIL"
+      printf "%-6s %-16s %-7s %-16s %-7s %s\n","-----","---------------","-----","---------------","-----","-------------------------"
     }{
-      printf "%-18s %-18s %-10s %s\n",$1,$2,$3,$4
+      printf "%-6s %-16s %-7s %-16s %-7s %s\n",$1,$2,$3,$4,$5,$6
     }'
 }
 
