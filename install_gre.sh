@@ -174,9 +174,14 @@ ping_loss_pct() {
   local dst_ip="$2"
   local out loss
 
-  out=$(/bin/ping -c "$PING_COUNT" -i "$PING_INTERVAL" -W "$PING_TIMEOUT" -w "$PING_DEADLINE" -I "$src_ip" "$dst_ip" 2>/dev/null || true)
+  if [[ "$src_ip" == "-" || -z "$src_ip" ]]; then
+    out=$(/bin/ping -c "$PING_COUNT" -i "$PING_INTERVAL" -W "$PING_TIMEOUT" -w "$PING_DEADLINE" "$dst_ip" 2>&1 || true)
+  else
+    out=$(/bin/ping -c "$PING_COUNT" -i "$PING_INTERVAL" -W "$PING_TIMEOUT" -w "$PING_DEADLINE" -I "$src_ip" "$dst_ip" 2>&1 || true)
+  fi
 
-  loss=$(echo "$out" | awk -F',' '/packet loss/ {gsub(/%/,"",$3); gsub(/ /,"",$3); print $3}' | head -n1)
+  loss=$(echo "$out" | grep -oE '[0-9]+(\.[0-9]+)?% packet loss' | head -n1 | cut -d% -f1 || true)
+
   if [[ -z "${loss:-}" ]]; then
     echo "100"
     return 0
@@ -245,7 +250,7 @@ status_ping_all() {
       row_file="$tmpdir/row_${tid}"
 
       if [[ -n "${local_pub:-}" && -n "${peer_pub:-}" ]]; then
-        ping_loss_pct "$local_pub" "$peer_pub" > "$peer_file" &
+        ping_loss_pct "-" "$peer_pub" > "$peer_file" &
       else
         peer_pub="-"
         echo "100" > "$peer_file" &
